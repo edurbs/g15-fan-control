@@ -1,0 +1,16 @@
+[Unit]
+Description=Dell G15 temperature-driven fan controller (alienware-wmi AWCC boost)
+Documentation=file:///etc/g15-fan-control.conf
+After=systemd-modules-load.service
+After=power-profiles-daemon.service thermald.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/g15-fan-control
+# Safety net: on stop/kill, hand fans back to the BIOS (boost=0).
+ExecStopPost=/usr/local/sbin/g15-fan-control --release
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

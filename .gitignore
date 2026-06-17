@@ -1,0 +1,12 @@
+# editor / OS noise
+*.swp
+*.swo
+*~
+.DS_Store
+*.bak
+*.orig
+.idea/
+.vscode/
+
+# local Claude Code project settings (not part of the project)
+.claude/

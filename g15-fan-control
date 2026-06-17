@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+#
+# g15-fan-control — temperature-driven fan controller for Dell G15 5530.
+#
+# Uses the native alienware-wmi AWCC per-fan boost:
+#   fan1_boost -> CPU fan     (driven from CPU temp, max coretemp)
+#   fan2_boost -> Video fan   (driven from the hotter of CPU/GPU)
+#   release() resets EVERY fan*_boost it finds (fan1, fan2, fan3, ...)
+#
+# boost is 0..100, layered on the firmware's active thermal profile (keep
+# power-profiles-daemon on "balanced"). boost=0 hands the fan back to the
+# firmware. The BIOS critical-temperature trip always applies regardless of
+# boost, so the hardware is protected even if this daemon is wrong or dead.
+#
+# Config:  /etc/g15-fan-control.conf     Service: g15-fan-control.service
+set -u
+shopt -s nullglob
+
+CONF=/etc/g15-fan-control.conf
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+# ---- defaults (overridable in conf; fall-back target on validation failure) -
+DEF_INTERVAL=3
+DEF_CURVE="45:0 50:10 55:20 60:30 65:40 70:52 76:66 82:82 88:100"
+DEF_EMERGENCY_TEMP=88
+DEF_MAX_BOOST=100
+DEF_SMOOTH_STEP=5
+DEF_GPU_REFRESH_EVERY=3
+
+INTERVAL="${INTERVAL:-$DEF_INTERVAL}"
+CURVE="${CURVE:-$DEF_CURVE}"
+EMERGENCY_TEMP="${EMERGENCY_TEMP:-$DEF_EMERGENCY_TEMP}"
+MAX_BOOST="${MAX_BOOST:-$DEF_MAX_BOOST}"
+SMOOTH_STEP="${SMOOTH_STEP:-$DEF_SMOOTH_STEP}"
+GPU_REFRESH_EVERY="${GPU_REFRESH_EVERY:-$DEF_GPU_REFRESH_EVERY}"
+HWMON_NAME="${HWMON_NAME:-alienware_wmi}"
+CPU_HWMON_NAME="${CPU_HWMON_NAME:-coretemp}"
+CONTROL_GPU="${CONTROL_GPU:-1}"
+
+AW=""
+
+log() { logger -t g15-fan-control -- "$*"; echo "$*"; }
+
+resolve_hwmon() {           # $1 = name -> echo /sys/class/hwmon/hwmonN
+  local d
+  for d in /sys/class/hwmon/hwmon*; do
+    [ "$(cat "$d/name" 2>/dev/null)" = "$1" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# Validate every numeric setting + the curve shape. Returns 1 on any problem.
+# Curve rule: >=2 points "uint:uint", strictly ascending temps, NON-DECREASING
+# boosts — so cooling never falls as temperature rises.
+validate_config() {
+  local v val err=0
+  for v in INTERVAL EMERGENCY_TEMP MAX_BOOST SMOOTH_STEP GPU_REFRESH_EVERY; do
+    val="${!v}"
+    if ! is_uint "$val"; then log "CONFIG ERROR: $v='$val' is not a non-negative integer"; err=1; fi
+  done
+  local pts=( $CURVE )
+  if [ "${#pts[@]}" -lt 2 ]; then log "CONFIG ERROR: CURVE needs at least 2 points"; err=1; fi
+  local pt t b prev_t=-1 prev_b=-1
+  for pt in "${pts[@]}"; do
+    if [[ ! "$pt" =~ ^[0-9]+:[0-9]+$ ]]; then
+      log "CONFIG ERROR: bad CURVE point '$pt' (expected temp:boost integers)"; err=1; continue
+    fi
+    t=${pt%%:*}; b=${pt##*:}
+    if [ "$t" -le "$prev_t" ]; then log "CONFIG ERROR: CURVE temps must be strictly ascending (at '$pt')"; err=1; fi
+    if [ "$b" -lt "$prev_b" ]; then log "CONFIG ERROR: CURVE boosts must be non-decreasing (at '$pt')"; err=1; fi
+    prev_t=$t; prev_b=$b
+  done
+  return $err
+}
+
+max_coretemp() {            # echo hottest coretemp in deg C
+  local d t raw v mx=0
+  d="$(resolve_hwmon "$CPU_HWMON_NAME")" || return 1
+  for t in "$d"/temp*_input; do
+    [ -r "$t" ] || continue
+    raw="$(cat "$t" 2>/dev/null)"
+    [[ "$raw" =~ ^[0-9]+$ ]] || continue          # skip empty / non-numeric
+    v=$(( raw / 1000 ))
+    [ "$v" -gt "$mx" ] && mx=$v
+  done
+  [ "$mx" -gt 0 ] && echo "$mx"
+}
+
+gpu_temp() {
+  [ "$CONTROL_GPU" = "1" ] || return 1
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d '[:space:]'
+}
+
+# interpolate CURVE "tempC:boost" (ascending) -> boost; clamp to endpoints
+boost_for() {
+  local temp="$1" prev_t="" prev_b="" t b pt
+  local pts=( $CURVE )
+  for pt in "${pts[@]}"; do
+    t=${pt%%:*}; b=${pt##*:}
+    if [ "$temp" -le "$t" ]; then
+      if [ -z "$prev_t" ]; then echo "$b"; return; fi
+      echo $(( prev_b + (b - prev_b) * (temp - prev_t) / (t - prev_t) ))
+      return
+    fi
+    prev_t=$t; prev_b=$b
+  done
+  echo "$prev_b"
+}
+
+clamp_boost() {            # 0..MAX_BOOST, snapped to SMOOTH_STEP
+  local b="$1"
+  [ "$b" -lt 0 ] && b=0
+  [ "$b" -gt "$MAX_BOOST" ] && b=$MAX_BOOST
+  if [ "$SMOOTH_STEP" -gt 0 ]; then
+    b=$(( (b + SMOOTH_STEP / 2) / SMOOTH_STEP * SMOOTH_STEP ))
+  fi
+  echo "$b"
+}
+
+acquire() {
+  AW="$(resolve_hwmon "$HWMON_NAME")" || { log "ERROR: $HWMON_NAME hwmon not found"; return 1; }
+}
+
+# reset every fan*_boost back to the firmware
+release() {
+  [ -n "$AW" ] || return 0
+  log "returning fans to BIOS control (boost=0)"
+  local f
+  for f in "$AW"/fan*_boost; do
+    echo 0 > "$f" 2>/dev/null || true
+  done
+}
+trap release EXIT INT TERM
+
+# --release: used by systemd ExecStopPost (works even if the config is broken)
+if [ "${1:-}" = "--release" ]; then
+  AW="$(resolve_hwmon "$HWMON_NAME")" && release
+  exit 0
+fi
+
+# validate config; on any problem, fall back to the built-in defaults so the
+# machine stays controlled instead of crash-looping or under-cooling.
+if ! validate_config; then
+  log "WARNING: invalid config in ${CONF:-<none>} — using built-in defaults. Fix the file and restart."
+  INTERVAL=$DEF_INTERVAL; CURVE=$DEF_CURVE; EMERGENCY_TEMP=$DEF_EMERGENCY_TEMP
+  MAX_BOOST=$DEF_MAX_BOOST; SMOOTH_STEP=$DEF_SMOOTH_STEP; GPU_REFRESH_EVERY=$DEF_GPU_REFRESH_EVERY
+fi
+
+log "started (interval=${INTERVAL}s, gpu=$CONTROL_GPU, curve='${CURVE}')"
+loop=0; cached_gpu=""
+while true; do
+  acquire || { sleep "$INTERVAL"; continue; }
+  cpu="$(max_coretemp)"
+  [ -n "$cpu" ] || { sleep "$INTERVAL"; continue; }
+
+  loop=$((loop + 1))
+  if [ $((loop % GPU_REFRESH_EVERY)) -eq 0 ]; then cached_gpu="$(gpu_temp)"; fi
+  gpu="$cached_gpu"
+
+  eff="$cpu"; { [ -n "$gpu" ] && [ "$gpu" -gt "$cpu" ]; } && eff=$gpu
+  b1="$(clamp_boost "$(boost_for "$cpu")")"      # CPU fan  <- CPU temp
+  b2="$(clamp_boost "$(boost_for "$eff")")"      # Video fan <- hottest of CPU/GPU
+
+  if [ "$cpu" -ge "$EMERGENCY_TEMP" ] || { [ -n "$gpu" ] && [ "$gpu" -ge "$EMERGENCY_TEMP" ]; }; then
+    b1=$MAX_BOOST; b2=$MAX_BOOST
+  fi
+
+  echo "$b1" > "$AW/fan1_boost" 2>/dev/null
+  echo "$b2" > "$AW/fan2_boost" 2>/dev/null
+  sleep "$INTERVAL"
+done
