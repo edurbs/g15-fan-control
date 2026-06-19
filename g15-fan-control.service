@@ -2,7 +2,12 @@
 Description=Dell G15 temperature-driven fan controller (alienware-wmi AWCC boost)
 Documentation=file:///etc/g15-fan-control.conf
 After=systemd-modules-load.service
-After=power-profiles-daemon.service thermald.service
+# Do NOT order After=power-profiles-daemon.service: on this machine ppd is itself
+# ordered after multi-user.target, which combined with WantedBy=multi-user.target
+# below creates a boot ordering cycle that silently aborts this unit's start (seen
+# as inactive/dead despite being enabled). The only hard dependency is the
+# alienware_wmi module (loaded by systemd-modules-load above). boost=0 hands the
+# fans back to the BIOS until the curve triggers, so an early start is safe.
 
 [Service]
 Type=simple
