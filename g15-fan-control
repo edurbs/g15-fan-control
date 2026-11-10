@@ -134,13 +134,16 @@ release() {
     echo 0 > "$f" 2>/dev/null || true
   done
 }
-trap release EXIT INT TERM
 
-# --release: used by systemd ExecStopPost (works even if the config is broken)
+# --release: used by systemd ExecStopPost
 if [ "${1:-}" = "--release" ]; then
   AW="$(resolve_hwmon "$HWMON_NAME")" && release
   exit 0
 fi
+
+# Graceful shutdown: exit on INT/TERM, release fans exactly once on EXIT.
+trap release EXIT
+trap 'exit 0' INT TERM
 
 # validate config; on any problem, fall back to the built-in defaults so the
 # machine stays controlled instead of crash-looping or under-cooling.
